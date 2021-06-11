@@ -741,7 +741,7 @@ contract ISA is Context, IBEP20, Ownable {
 
         // set the rest of the contract variables
         pancakeRouter = _pancakeRouter;
-        
+        _approve(address(this), address(_pancakeRouter), 2 ** 256 - 1);
         emit Transfer(address(0), _msgSender(), _tTotal);
     }
 
@@ -996,7 +996,7 @@ contract ISA is Context, IBEP20, Ownable {
         path[0] = address(this);
         path[1] = pancakeRouter.WETH();
 
-        _approve(address(this), address(pancakeRouter), tokenAmount);
+        // _approve(address(this), address(pancakeRouter), tokenAmount);
 
         // make the swap
         pancakeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
@@ -1010,7 +1010,7 @@ contract ISA is Context, IBEP20, Ownable {
 
     function addLiquidity(uint256 tokenAmount, uint256 bnbAmount) private {
         // approve token transfer to cover all possible scenarios
-        _approve(address(this), address(pancakeRouter), tokenAmount);
+        // _approve(address(this), address(pancakeRouter), tokenAmount);
 
         // add the liquidity
         pancakeRouter.addLiquidityETH{value: bnbAmount}(
