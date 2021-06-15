@@ -681,20 +681,26 @@ contract ISA is Context, IBEP20, Ownable {
     using Address for address;
 
     mapping (address => uint256) private _rOwned;
+    mapping (address => uint256) private _tOwned;
     mapping (address => mapping (address => uint256)) private _allowances;
 
+    mapping (address => bool) private _isExcludedFromFee;
+
+    mapping (address => bool) private _isExcluded;
+    address[] private _excluded;
+
     uint256 private constant MAX = ~uint256(0);
-    uint256 private _tTotal = 1000000000000 * 10**9;
+    uint256 private _tTotal = 10**9 * 10**6 * 10**9;
     uint256 private _rTotal = (MAX - (MAX % _tTotal));
+    uint256 private _tFeeTotal;
 
     string private _name = "ISAToken";
     string private _symbol = "ISA";
     uint8 private _decimals = 9;
     
-    uint256 public _burnFee = 2;
-    uint256 public _holderFee = 2;
-    uint256 public _charityFee = 2;
-    uint256 public _liquidityFee = 2;
+    uint256 public _fee = 2;
+    
+    uint256 private _previousFee = _fee;
 
     IPancakeRouter02 public immutable pancakeRouter;
     address public immutable pancakePair;
@@ -702,8 +708,7 @@ contract ISA is Context, IBEP20, Ownable {
     bool inSwapAndLiquify = false;
     bool public swapAndLiquifyEnabled = true;
     
-    uint256 public _maxTxAmount = 5000000 * 10**6 * 10**9;
-    uint256 private numTokensSellToAddToLiquidity = 10**6 * 10**9;
+    uint256 private numTokensSellToAddToLiquidity = 500000 * 10**6 * 10**9;
     
     struct History {
         uint256 timestamp;
@@ -733,7 +738,7 @@ contract ISA is Context, IBEP20, Ownable {
         _rOwned[_msgSender()] = _rTotal;
         _accounts.push(_msgSender());
         // PancakeSwap Router address: (BSC testnet) 0xD99D1c33F9fC3444f8101754aBC46c52416550D1  (BSC mainnet) V2 0x10ED43C718714eb63d5aA57B78B54704E256024E
-        IPancakeRouter02 _pancakeRouter = IPancakeRouter02(0xD99D1c33F9fC3444f8101754aBC46c52416550D1);
+        IPancakeRouter02 _pancakeRouter = IPancakeRouter02(0x10ED43C718714eb63d5aA57B78B54704E256024E);
         _buyHistories[_msgSender()].push(History(block.timestamp, _tTotal));
          // Create a pancakeswap pair for this new token
         pancakePair = IPancakeFactory(_pancakeRouter.factory())
@@ -741,7 +746,10 @@ contract ISA is Context, IBEP20, Ownable {
 
         // set the rest of the contract variables
         pancakeRouter = _pancakeRouter;
-        _approve(address(this), address(_pancakeRouter), 2 ** 256 - 1);
+        //exclude owner and this contract from fee
+
+        _isExcludedFromFee[address(this)] = true;
+        
         emit Transfer(address(0), _msgSender(), _tTotal);
     }
 
@@ -762,6 +770,7 @@ contract ISA is Context, IBEP20, Ownable {
     }
 
     function balanceOf(address account) public view override returns (uint256) {
+        if (_isExcluded[account]) return _tOwned[account];
         return tokenFromReflection(_rOwned[account]);
     }
 
@@ -795,42 +804,108 @@ contract ISA is Context, IBEP20, Ownable {
         return true;
     }
 
+    function isExcludedFromReward(address account) external view returns (bool) {
+        return _isExcluded[account];
+    }
+
+    function totalFees() external view returns (uint256) {
+        return _tFeeTotal;
+    }
+
+    function deliver(uint256 tAmount) external {
+        address sender = _msgSender();
+        require(!_isExcluded[sender], "Excluded addresses cannot call this function");
+        (uint256 rAmount,,,,) = _getValues(tAmount);
+        _rOwned[sender] = _rOwned[sender].sub(rAmount);
+        _rTotal = _rTotal.sub(rAmount);
+        _tFeeTotal = _tFeeTotal.add(tAmount);
+    }
+
+
     function tokenFromReflection(uint256 rAmount) public view returns(uint256) {
         require(rAmount <= _rTotal, "Amount must be less than total reflections");
         uint256 currentRate =  _getRate();
         return rAmount.div(currentRate);
     }
+
+    function excludeFromReward(address account) public onlyOwner() {
+        // require(account != 0x05fF2B0DB69458A0750badebc4f9e13aDd608C7F, 'We can not exclude Pancakeswap router.');
+        require(!_isExcluded[account], "Account is already excluded");
+        if(_rOwned[account] > 0) {
+            _tOwned[account] = tokenFromReflection(_rOwned[account]);
+        }
+        _isExcluded[account] = true;
+        _excluded.push(account);
+    }
+
+    function includeInReward(address account) external onlyOwner() {
+        require(_isExcluded[account], "Account is not excluded");
+        for (uint256 i = 0; i < _excluded.length; i++) {
+            if (_excluded[i] == account) {
+                _excluded[i] = _excluded[_excluded.length - 1];
+                _tOwned[account] = 0;
+                _isExcluded[account] = false;
+                _excluded.pop();
+                break;
+            }
+        }
+    }
+    
+    function _transferBothExcluded(address sender, address recipient, uint256 tAmount) private {
+        (uint256 rAmount, uint256 rTransferAmount, uint256 rFee, uint256 tTransferAmount, uint256 tLiquidity) = _getValues(tAmount);
+        _tOwned[sender] = _tOwned[sender].sub(tAmount);
+        _rOwned[sender] = _rOwned[sender].sub(rAmount);
+        _tOwned[recipient] = _tOwned[recipient].add(tTransferAmount);
+        _rOwned[recipient] = _rOwned[recipient].add(rTransferAmount);        
+        _takeLiquidity(tLiquidity);
+        _reflectFee(rFee, tLiquidity);
+        emit Transfer(sender, recipient, tTransferAmount);
+    }
+    
+    function excludeFromFee(address account) public onlyOwner {
+        _isExcludedFromFee[account] = true;
+    }
+    
+    function includeInFee(address account) public onlyOwner {
+        _isExcludedFromFee[account] = false;
+    }
+
+    function setSwapAndLiquifyEnabled(bool _enabled) public onlyOwner {
+        swapAndLiquifyEnabled = _enabled;
+        emit SwapAndLiquifyEnabledUpdated(_enabled);
+    }
     
      //to receive BNB from pancakeRouter when swapping
     receive() external payable {}
+    
+    /// This will allow to rescue BNB sent by mistake directly to the contract
+    function rescueBNBFromContract() external onlyOwner {
+        address payable _owner = _msgSender();
+        _owner.transfer(address(this).balance);
+    }
 
-    function _reflectFee(uint256 rFee) private {
+    function _reflectFee(uint256 rFee, uint256 tFee) private {
         _rTotal = _rTotal.sub(rFee);
+        _tFeeTotal = _tFeeTotal.add(tFee);
     }
 
     function _getValues(uint256 tAmount) private view returns (uint256, uint256, uint256, uint256, uint256) {
-        (uint256 tTransferAmount, uint256 tBurn) = _getTValues(tAmount);
-        (uint256 rAmount, uint256 rTransferAmount, uint256 rBurn) = _getRValues(tAmount, tBurn, _getRate());
-        return (rAmount, rTransferAmount, rBurn, tTransferAmount, tBurn);
+        (uint256 tTransferAmount, uint256 tFee) = _getTValues(tAmount);
+        (uint256 rAmount, uint256 rTransferAmount, uint256 rFee) = _getRValues(tAmount, tFee, _getRate());
+        return (rAmount, rTransferAmount, rFee, tTransferAmount, tFee);
     }
 
     function _getTValues(uint256 tAmount) private view returns (uint256, uint256) {
-        uint256 tBurn = calculateBurnFee(tAmount);
-        uint256 tHolder = calculateHolderFee(tAmount);
-        uint256 tCharity = calculateCharityFee(tAmount);
-        uint256 tLiquidity = calculateLiquidityFee(tAmount);
-        uint256 tTransferAmount = tAmount.sub(tBurn).sub(tHolder).sub(tCharity).sub(tLiquidity);
-        return (tTransferAmount, tBurn);
+        uint256 tFee = calculateFee(tAmount);
+        uint256 tTransferAmount = tAmount.sub(tFee.mul(4));
+        return (tTransferAmount, tFee);
     }
 
-    function _getRValues(uint256 tAmount, uint256 tBurn, uint256 currentRate) private pure returns (uint256, uint256, uint256) {
+    function _getRValues(uint256 tAmount, uint256 tFee, uint256 currentRate) private pure returns (uint256, uint256, uint256) {
         uint256 rAmount = tAmount.mul(currentRate);
-        uint256 rBurn = tBurn.mul(currentRate);
-        uint256 rHolder = tBurn.mul(currentRate);
-        uint256 rCharity = tBurn.mul(currentRate);
-        uint256 rLiquidity = tBurn.mul(currentRate);
-        uint256 rTransferAmount = rAmount.sub(rBurn).sub(rHolder).sub(rCharity).sub(rLiquidity);
-        return (rAmount, rTransferAmount, rBurn);
+        uint256 rFee = tFee.mul(currentRate);
+        uint256 rTransferAmount = rAmount.sub(rFee.mul(4));
+        return (rAmount, rTransferAmount, rFee);
     }
 
     function _getRate() private view returns(uint256) {
@@ -840,7 +915,13 @@ contract ISA is Context, IBEP20, Ownable {
 
     function _getCurrentSupply() private view returns(uint256, uint256) {
         uint256 rSupply = _rTotal;
-        uint256 tSupply = _tTotal;
+        uint256 tSupply = _tTotal;      
+        for (uint256 i = 0; i < _excluded.length; i++) {
+            if (_rOwned[_excluded[i]] > rSupply || _tOwned[_excluded[i]] > tSupply) return (_rTotal, _tTotal);
+            rSupply = rSupply.sub(_rOwned[_excluded[i]]);
+            tSupply = tSupply.sub(_tOwned[_excluded[i]]);
+        }
+        if (rSupply < _rTotal.div(_tTotal)) return (_rTotal, _tTotal);
         return (rSupply, tSupply);
     }
     
@@ -848,32 +929,32 @@ contract ISA is Context, IBEP20, Ownable {
         uint256 currentRate =  _getRate();
         uint256 rLiquidity = tLiquidity.mul(currentRate);
         _rOwned[address(this)] = _rOwned[address(this)].add(rLiquidity);
+        if(_isExcluded[address(this)])
+            _tOwned[address(this)] = _tOwned[address(this)].add(tLiquidity);
     }
     
-    function calculateBurnFee(uint256 _amount) private view returns (uint256) {
-        return _amount.mul(_burnFee).div(
-            10**2
-        );
-    }
-    
-    function calculateHolderFee(uint256 _amount) private view returns (uint256) {
-        return _amount.mul(_holderFee).div(
+    function calculateFee(uint256 _amount) private view returns (uint256) {
+        return _amount.mul(_fee).div(
             10**2
         );
     }
 
-    function calculateLiquidityFee(uint256 _amount) private view returns (uint256) {
-        return _amount.mul(_liquidityFee).div(
-            10**2
-        );
+    function removeAllFee() private {
+        if(_fee == 0) return;
+        
+        _previousFee = _fee;
+        
+        _fee = 0;
     }
     
-    function calculateCharityFee(uint256 _amount) private view returns (uint256) {
-        return _amount.mul(_charityFee).div(
-            10**2
-        );
+    function restoreAllFee() private {
+        _fee = _previousFee;
     }
-
+    
+    function isExcludedFromFee(address account) public view returns(bool) {
+        return _isExcludedFromFee[account];
+    }
+    
     function _approve(address owner, address spender, uint256 amount) private {
         require(owner != address(0), "BEP20: approve from the zero address");
         require(spender != address(0), "BEP20: approve to the zero address");
@@ -941,13 +1022,7 @@ contract ISA is Context, IBEP20, Ownable {
         // tokens that we need to initiate a swap + liquidity lock?
         // also, don't get caught in a circular liquidity event.
         // also, don't swap & liquify if sender is pancake pair.
-        // uint256 contractTokenBalance = balanceOf(address(this));
         uint256 contractTokenBalance = balanceOf(address(this));
-        
-        if(contractTokenBalance >= _maxTxAmount)
-        {
-            contractTokenBalance = _maxTxAmount;
-        }
         
         bool overMinTokenBalance = contractTokenBalance >= numTokensSellToAddToLiquidity;
         if (
@@ -958,16 +1033,24 @@ contract ISA is Context, IBEP20, Ownable {
         ) {
             contractTokenBalance = numTokensSellToAddToLiquidity;
             //add liquidity
-            swapAndLiquify(contractTokenBalance);
+            _swapAndLiquify(contractTokenBalance);
+        }
+        
+        //indicates if fee should be deducted from transfer
+        bool takeFee = true;
+        
+        //if any account belongs to _isExcludedFromFee account then remove the fee
+        if(_isExcludedFromFee[from] || _isExcludedFromFee[to]){
+            takeFee = false;
         }
         
         //transfer amount, it will take tax, burn, liquidity fee
-        _tokenTransfer(from,to,amount, amount_accounts);
+        _tokenTransfer(from,to,amount, amount_accounts, takeFee);
         
         
     }
 
-    function swapAndLiquify(uint256 contractTokenBalance) private lockTheSwap {
+    function _swapAndLiquify(uint256 contractTokenBalance) private lockTheSwap {
         // split the contract balance into halves
         uint256 half = contractTokenBalance.div(2);
         uint256 otherHalf = contractTokenBalance.sub(half);
@@ -996,7 +1079,7 @@ contract ISA is Context, IBEP20, Ownable {
         path[0] = address(this);
         path[1] = pancakeRouter.WETH();
 
-        // _approve(address(this), address(pancakeRouter), tokenAmount);
+        _approve(address(this), address(pancakeRouter), tokenAmount);
 
         // make the swap
         pancakeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
@@ -1010,7 +1093,7 @@ contract ISA is Context, IBEP20, Ownable {
 
     function addLiquidity(uint256 tokenAmount, uint256 bnbAmount) private {
         // approve token transfer to cover all possible scenarios
-        // _approve(address(this), address(pancakeRouter), tokenAmount);
+        _approve(address(this), address(pancakeRouter), tokenAmount);
 
         // add the liquidity
         pancakeRouter.addLiquidityETH{value: bnbAmount}(
@@ -1024,8 +1107,22 @@ contract ISA is Context, IBEP20, Ownable {
     }
 
     //this method is responsible for taking all fee, if takeFee is true
-    function _tokenTransfer(address sender, address recipient, uint256 amount, uint256 amount_accounts) private {
-        _transferStandard(sender, recipient, amount, amount_accounts);
+    function _tokenTransfer(address sender, address recipient, uint256 amount, uint256 amount_accounts, bool takeFee) private {
+	    if(!takeFee)
+            removeAllFee();
+        
+        if (_isExcluded[sender] && !_isExcluded[recipient]) {
+            _transferFromExcluded(sender, recipient, amount);
+        } else if (!_isExcluded[sender] && _isExcluded[recipient]) {
+            _transferToExcluded(sender, recipient, amount);
+        } else if (_isExcluded[sender] && _isExcluded[recipient]) {
+            _transferBothExcluded(sender, recipient, amount);
+        } else {
+            _transferStandard(sender, recipient, amount, amount_accounts);
+	    }
+        
+        if(!takeFee)
+            restoreAllFee();
     }
 
     function _transferStandard(address sender, address recipient, uint256 tAmount, uint256 amount_accounts) private {
@@ -1048,8 +1145,27 @@ contract ISA is Context, IBEP20, Ownable {
         }
         
         _takeLiquidity(tLiquidity);
-        _reflectFee(rBurn);
+        _reflectFee(rBurn, tLiquidity);
         emit Transfer(sender, recipient, tTransferAmount);
     }
 
+    function _transferToExcluded(address sender, address recipient, uint256 tAmount) private {
+        (uint256 rAmount, uint256 rTransferAmount, uint256 rFee, uint256 tTransferAmount, uint256 tLiquidity) = _getValues(tAmount);
+        _rOwned[sender] = _rOwned[sender].sub(rAmount);
+        _tOwned[recipient] = _tOwned[recipient].add(tTransferAmount);
+        _rOwned[recipient] = _rOwned[recipient].add(rTransferAmount);           
+        _takeLiquidity(tLiquidity);
+        _reflectFee(rFee, tLiquidity);
+        emit Transfer(sender, recipient, tTransferAmount);
+    }
+
+    function _transferFromExcluded(address sender, address recipient, uint256 tAmount) private {
+        (uint256 rAmount, uint256 rTransferAmount, uint256 rFee, uint256 tTransferAmount, uint256 tLiquidity) = _getValues(tAmount);
+        _tOwned[sender] = _tOwned[sender].sub(tAmount);
+        _rOwned[sender] = _rOwned[sender].sub(rAmount);
+        _rOwned[recipient] = _rOwned[recipient].add(rTransferAmount);   
+        _takeLiquidity(tLiquidity);
+        _reflectFee(rFee, tLiquidity);
+        emit Transfer(sender, recipient, tTransferAmount);
+    }
 }
